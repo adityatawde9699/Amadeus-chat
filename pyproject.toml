@@ -1,0 +1,15 @@
+[project]
+name = "llama"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "llama-cpp-python>=0.3.23",
+    "numpy>=2.4.6",
+    "pypdf>=6.12.2",
+    "python-dotenv>=1.2.2",
+    "rank-bm25>=0.2.2",
+    "rich>=15.0.0",
+    "sentence-transformers>=5.5.1",
+]

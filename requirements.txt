@@ -1,0 +1,6 @@
+llama-cpp-python
+rich
+sentence-transformers
+numpy
+rank-bm25
+pypdf
