@@ -1,90 +1,173 @@
-# Amadeus-chat: Local LLM CLI Chat with Hybrid RAG & Memory Guard
+# Amadeus-chat: Local LLM CLI with Hybrid RAG, Tool Execution & System Awareness
 
-> **Note:** This is a side branch of the main [Amadeus-AI](https://github.com/adityatawde9699/Amadeus-AI) project. While the main Amadeus-AI is fully autonomous, **Amadeus-chat** is designed specifically as a non-autonomous, general-use CLI chat interface for manual interactions and RAG-based document querying.
+> **Note:** This is a side branch of the main [Amadeus-AI](https://github.com/adityatawde9699/Amadeus-AI) project. While the main Amadeus-AI is fully autonomous, **Amadeus-chat** is designed as a non-autonomous, local CLI chat interface for manual interactions, RAG-based document querying, and safe system tool execution.
 
-A powerful, entirely local Command-Line Interface (CLI) for running large language models (LLMs) securely on your machine. It features an advanced Retrieval-Augmented Generation (RAG) system using Reciprocal Rank Fusion (RRF), automatic memory compression, and built-in model management.
+A powerful, entirely local Command-Line Interface (CLI) for running quantized LLMs securely on your machine. Amadeus features advanced Hybrid RAG (BM25 + Semantic + RRF fusion), smart memory compression, live system awareness via `psutil`, and a safe whitelisted shell tool execution pipeline — all within a single Python file.
+
+---
 
 ## ✨ Features
 
-- **100% Local Privacy:** Runs locally using `llama.cpp` (via `llama-cpp-python`). No data is sent to external APIs.
-- **Advanced Hybrid RAG:** 
-  - Ingests PDFs, Markdown, CSVs, JSON, and text files.
-  - Recursive chunking with word-aligned overlap to prevent mid-word fragmentation.
-  - Combines BM25 (keyword search) and Semantic Search (Sentence Transformers) using Reciprocal Rank Fusion (RRF).
-  - Cross-encoder re-ranking filters out irrelevant context.
-- **Smart Memory Guard:** Automatically summarizes older conversations to stay within the LLM's token budget while preserving verbatim recent history.
-- **Easy Model Management:** Configurable script to safely download `.gguf` models directly from Hugging Face into a dedicated `Models/` folder.
-- **Rich Terminal UI:** Beautifully formatted markdown, tables, and progress bars using the `rich` library.
+### 🔒 100% Local & Private
+Runs entirely on-device using `llama-cpp-python`. No data is ever sent to external APIs.
+
+### 🔍 Advanced Hybrid RAG
+- Ingests **PDF, Markdown, CSV, JSON, HTML, TXT, RST, and Python** files.
+- **Recursive chunking** with word-aligned overlap to prevent mid-word fragment corruption.
+- **BM25 (keyword)** + **Semantic (Sentence Transformers)** search combined via **Reciprocal Rank Fusion (RRF)** — no fragile linear weighting needed.
+- **Cross-encoder re-ranking** filters out irrelevant context before injecting into the prompt.
+- **Duplicate detection** via MD5 hash prevents double-indexing the same file.
+- **Persistent index** save/load via `/index save|load <path>`.
+
+### 🧠 Smart Memory Management
+- **Sliding window** retains the most recent turns verbatim.
+- **LLM-powered summarization** compresses older turns to a rolling summary, staying within token budget.
+- **Token budget guard** warns at 80% and hard-blocks at 95% of the context window.
+
+### 🛠️ Safe Tool Execution
+Amadeus can call tools to interact with your system:
+- **Shell Tool** — Runs whitelisted commands (e.g., `ls`, `find`, `git`, `python3`). Blocked patterns prevent destructive operations (`rm -rf`, `sudo`, `mkfs`, etc.). Use `/approve` to force-run a blocked command.
+- **Sysinfo Tool** — Reads CPU %, RAM, disk usage, battery status, and top processes via `psutil`.
+
+### 🧹 Chain-of-Thought Filtering
+A streaming `ThinkFilter` strips `<think>...</think>` blocks in real time, ensuring the model never leaks internal reasoning to the user.
+
+### ⚙️ Runtime Configuration
+Change any config value live with `/set <key> <value>` — no restart required.
+
+### 📊 Rich Terminal UI
+Beautifully formatted output using the `rich` library: markdown rendering, tables, progress bars, and inline benchmark stats after every turn.
 
 ---
 
 ## 🚀 Installation
 
-This project uses [uv](https://github.com/astral-sh/uv) as its lightning-fast package manager.
+This project uses [uv](https://github.com/astral-sh/uv) as its package manager.
 
-1. **Clone the repository and enter the directory:**
+1. **Clone the repository:**
    ```bash
-   cd path/to/llama
+   git clone https://github.com/adityatawde9699/Amadeus-chat.git
+   cd Amadeus-chat
    ```
 
-2. **Initialize and install dependencies:**
-   The `uv` package manager handles creating the virtual environment and installing all required packages (like `torch`, `llama-cpp-python`, `sentence-transformers`, etc.).
+2. **Install dependencies:**
    ```bash
    uv sync
    ```
-   *(Or activate the virtual environment manually: `source .venv/bin/activate`)*
+   *(Or activate manually: `source .venv/bin/activate`)*
+
+3. **Optional PDF support:**
+   ```bash
+   uv pip install pypdf
+   ```
 
 ---
 
 ## 📥 Downloading a Model
 
-Before chatting, you need a model. We use quantized `.gguf` models (like Q4_K_M) for the best balance of speed and quality.
+Before chatting you need a quantized `.gguf` model. The project ships configured for **Qwen3.5-2B Q4_K_M**.
 
-1. Open the `.env` file and set the repository and filename of the model you want to download from Hugging Face:
+1. Edit `.env` to point at any model on Hugging Face:
    ```env
-   HF_REPO_ID="bartowski/gemma-2-9b-it-GGUF"
-   HF_FILENAME="gemma-2-9b-it-Q4_K_M.gguf"
+   HF_REPO_ID="Jackrong/Qwen3.5-2B-Claude-4.6-Opus-Reasoning-Distilled-GGUF"
+   HF_FILENAME="Qwen3.5-2B.Q4_K_M.gguf"
    ```
 
 2. Run the download script:
    ```bash
    uv run download_model.py
    ```
-   The model will be securely downloaded into the `Models/` directory.
+   The model is saved into the `Models/` directory.
 
 ---
 
 ## 💬 Usage
 
-Start the chat application by pointing it to your downloaded model:
-
+Start with the default model (set in `Config`):
 ```bash
-uv run chat.py --model ./Models/gemma-2-9b-it-Q4_K_M.gguf
+uv run chat.py
 ```
 
-*(You can also set `--ctx 8192` to increase the context window size if your hardware supports it).*
+Or override any parameter via CLI flags:
+```bash
+uv run chat.py --model ./Models/my-model.Q4_K_M.gguf --ctx 8192 --gpu-layers 35
+```
 
-### In-Chat Commands
+Pre-load a document into RAG at startup:
+```bash
+uv run chat.py --load ./notes.pdf --load ./README.md
+```
 
-Once the chat is running, you can use the following commands:
-
-- `/help` - Show all available commands.
-- `/load <path/to/file>` - Ingest a document into the RAG vector store.
-- `/docs` - List all currently indexed documents.
-- `/rag on|off` - Toggle whether to inject document context into the LLM prompt.
-- `/rag clear` - Wipe the vector store and BM25 index.
-- `/model <path/to/model.gguf>` - Hot-swap the running LLM without restarting.
-- `/memory` - View the current conversation state and the rolling summary.
-- `/clear` - Clear the conversation history (keeps RAG index intact).
-- `/bench` - Show performance benchmarking stats (Tokens/sec, Time to First Token).
-- `/save` / `/export` - Save the raw history to JSON or export it as a Markdown file.
-- `/quit` - Exit gracefully and auto-save the session.
+Override the system prompt:
+```bash
+uv run chat.py --system "You are a Python expert. Be terse."
+```
 
 ---
 
-## ⚙️ Architecture details
+## 🖥️ CLI Flags
 
-- **Embedder:** `all-MiniLM-L6-v2` (Fast and lightweight)
-- **Re-ranker:** `cross-encoder/ms-marco-MiniLM-L-6-v2`
-- **Vector Store:** Custom pure-NumPy pre-normalized matrix for O(1) query-time normalization.
-- **RAG Fusion:** Uses RRF to combine sparse (BM25) and dense (Cosine Similarity) retrieval, avoiding sensitive linear weighting hyper-parameters.
+| Flag | Default | Description |
+|---|---|---|
+| `--model` | `Models/Qwen3.5-2B.Q4_K_M.gguf` | Path to `.gguf` model file |
+| `--ctx` | `8192` | Context window size (tokens) |
+| `--max-tokens` | `4096` | Max tokens per response |
+| `--temperature` | `0.78` | Sampling temperature |
+| `--gpu-layers` | `0` | Layers to offload to GPU |
+| `--threads` | `4` | CPU inference threads |
+| `--embed-model` | `all-MiniLM-L6-v2` | SentenceTransformer for embeddings |
+| `--rerank-model` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | CrossEncoder for re-ranking |
+| `--alpha` | `0.55` | Hybrid weight (ignored when using RRF) |
+| `--no-rrf` | `False` | Use linear hybrid instead of RRF |
+| `--memory-turns` | `12` | Turns before memory compression triggers |
+| `--score-threshold` | `-5.0` | Min cross-encoder score to include a chunk |
+| `--load` | — | Pre-load a file into RAG (repeatable) |
+| `--load-index` | — | Pre-load a saved RAG index directory |
+| `--system` | — | Override the default system prompt |
+| `--no-auto-save` | `False` | Disable auto-save on exit |
+| `--log-level` | `WARNING` | Logging verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`) |
+
+---
+
+## ⌨️ In-Chat Commands
+
+| Command | Description |
+|---|---|
+| `/help` | Show all available commands |
+| `/load <file>` | Index a document into RAG (PDF/MD/TXT/PY/JSON/CSV/HTML) |
+| `/docs` | List all currently indexed documents |
+| `/rag on\|off` | Toggle RAG context injection |
+| `/rag clear` | Wipe the vector store and BM25 index |
+| `/index save <path>` | Save the RAG index to disk |
+| `/index load <path>` | Load a previously saved RAG index |
+| `/model <path>` | Hot-swap the LLM without restarting |
+| `/memory` | Show conversation state and rolling summary |
+| `/clear` | Clear conversation history (keeps RAG index) |
+| `/history` | Print the full conversation |
+| `/run <command>` | Execute a shell command (safety-checked) |
+| `/sysinfo` | Show CPU, RAM, disk, and battery usage |
+| `/approve` | Force-run the last blocked shell command |
+| `/set <key> <value>` | Change any config value at runtime |
+| `/config` | Show current configuration |
+| `/bench` | Show per-turn benchmark stats |
+| `/save` | Save chat history to `chat_history.json` |
+| `/export` | Export conversation to `chat_export.md` |
+| `/quit` | Exit gracefully and auto-save |
+
+---
+
+## ⚙️ Architecture
+
+| Component | Detail |
+|---|---|
+| **LLM Backend** | `llama-cpp-python` — 4-bit GGUF quantization |
+| **Embedder** | `all-MiniLM-L6-v2` (fast, lightweight) |
+| **Re-ranker** | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
+| **RAG Fusion** | Reciprocal Rank Fusion (BM25 + cosine similarity) |
+| **Vector Store** | Pure NumPy, pre-normalized matrix — O(1) query-time normalization |
+| **BM25 Index** | Deferred rebuild — O(N) incremental adds |
+| **Chunker** | 3-level recursive (paragraph → sentence → word), word-aligned overlap |
+| **Memory** | Sliding window + LLM summarization + token budget guard |
+| **Tools** | Whitelisted shell executor + psutil sysinfo |
+| **CoT Filter** | Streaming `ThinkFilter` strips `<think>...</think>` in real time |
+| **System Info** | `psutil` — CPU, RAM, disk, battery, top processes |
