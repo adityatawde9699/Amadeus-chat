@@ -48,10 +48,12 @@ import json
 import time
 import queue
 import string
+import shlex
 import hashlib
 import logging
 import threading
 import argparse
+import subprocess
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Iterator
@@ -59,6 +61,7 @@ from collections import Counter
 
 # ── third-party ─────────────────────────────────────────────────────────────
 import numpy as np
+import psutil
 
 from rich.console  import Console
 from rich.panel    import Panel
@@ -85,12 +88,12 @@ log.addHandler(logging.NullHandler())   # silent by default; caller enables if n
 @dataclass
 class Config:
     # ── Model ──────────────────────────────────────────────────────────────
-    model_path      : str   = "/home/adityatawde9699/projects/my-ml-project/Amadeus-AI/Model/google_gemma-4-E2B-it-Q4_K_M.gguf"
+    model_path      : str   = "/home/adityatawde9699/projects/my-ml-project/llama/Models/Qwen3.5-2B.Q4_K_M.gguf"
     n_ctx           : int   = 8192
     n_gpu_layers    : int   = 0
     n_threads       : int   = 4
-    max_tokens      : int   = 512
-    temperature     : float = 0.7
+    max_tokens      : int   = 4096
+    temperature     : float = 0.78
     top_p           : float = 0.95
     top_k           : int   = 40
     repeat_penalty  : float = 1.1
@@ -98,7 +101,7 @@ class Config:
     # ── Memory ─────────────────────────────────────────────────────────────
     memory_max_turns      : int = 12   # turns before compression triggers
     memory_keep_recent    : int = 4    # verbatim recent turns always kept
-    memory_summary_tokens : int = 256  # max tokens for rolling summary
+    memory_summary_tokens : int = 512  # max tokens for rolling summary
 
     # ── RAG ────────────────────────────────────────────────────────────────
     embed_model          : str   = "all-MiniLM-L6-v2"
@@ -117,14 +120,35 @@ class Config:
 
     # ── Misc ───────────────────────────────────────────────────────────────
     system_prompt : str = (
-        "You are a helpful, concise, and accurate AI assistant running locally. "
-        "When given context documents, prioritise them over your training knowledge. "
-        "If the context does not contain sufficient information, say so clearly "
-        "rather than speculating. Be precise and direct."
+        "You are Amadeus, an intelligent local operating assistant.\n\n"
+        "CORE RULES:\n"
+        "- Answer concisely, directly, and professionally.\n"
+        "- Never output internal reasoning, thinking processes, or search steps.\n"
+        "- Never use formatting/tags like <think>, </think>, analysis:, or reasoning:.\n"
+        "- When a user request requires system interaction (e.g., executing commands, checking status, inspecting files), use the appropriate tool.\n\n"
+        "AVAILABLE TOOLS:\n"
+        "You have access to two tools. To execute a tool, write EXACTLY one JSON block on its own line using '```tool' syntax. Do not add any text on the same line as the code block markers.\n\n"
+        "1. Shell Command Tool:\n"
+        "Execute standard, safe shell commands on the local machine.\n"
+        "Example:\n"
+        '```tool\n{"tool": "shell", "command": "ls -la ~/Documents"}\n```\n\n'
+        "2. System Info Tool:\n"
+        "Retrieve CPU usage, RAM utilization, disk space, battery status, and top memory-consuming processes.\n"
+        "Example:\n"
+        '```tool\n{"tool": "sysinfo"}\n```\n\n'
+        "TOOL INSTRUCTIONS:\n"
+        "- Only call a tool when necessary to fulfill the user's query.\n"
+        "- Do not execute destructive, dangerous, or unauthorized commands.\n"
+        "- After a tool completes, the system will provide the tool results. Interpret these results and provide a clean, helpful response to the user.\n\n"
+        "CONTEXT & RAG RULES:\n"
+        "- If context documents are provided, prioritize them over your general training knowledge.\n"
+        "- If the provided context does not contain the answer, state that clearly instead of speculating."
     )
-    history_file  : str = "chat_history.json"
-    export_file   : str = "chat_export.md"
-    auto_save     : bool = True
+    history_file   : str  = "chat_history.json"
+    export_file    : str  = "chat_export.md"
+    auto_save      : bool = True
+    tool_timeout   : int  = 30      # seconds per command
+    max_tool_calls : int  = 3       # max tool invocations per turn
 
     def validate(self) -> None:
         """Raise ValueError on obviously invalid config."""
@@ -961,6 +985,317 @@ class LLMEngine:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# THINK-TAG FILTER  (strips <think>...</think> from streaming output)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ThinkFilter:
+    """
+    Strips chain-of-thought <think>...</think> blocks from streaming tokens.
+    Handles both single-token tags (common in Qwen) and fragmented delivery.
+    """
+
+    def __init__(self) -> None:
+        self.suppressing = False
+        self._partial    = ""
+
+    def feed(self, token: str) -> str:
+        """Feed a token, return text to display (may be empty if suppressed)."""
+        combined = self._partial + token
+        self._partial = ""
+
+        if self.suppressing:
+            if "</think>" in combined:
+                self.suppressing = False
+                after = combined.split("</think>", 1)[1]
+                return after.lstrip("\n")
+            return ""
+
+        if "<think>" in combined:
+            self.suppressing = True
+            before = combined.split("<think>", 1)[0]
+            return before
+
+        # Check for partial tag building at end of buffer
+        for i in range(min(6, len(combined)), 0, -1):
+            if "<think>"[:i] == combined[-i:]:
+                self._partial = combined[-i:]
+                return combined[:-i]
+
+        return combined
+
+    def flush(self) -> str:
+        """Flush remaining buffer at end of stream."""
+        out = self._partial if not self.suppressing else ""
+        self._partial = ""
+        return out
+
+    def clean(self, text: str) -> str:
+        """Post-process a complete string to remove any think blocks."""
+        import re as _re
+        cleaned = _re.sub(r'<think>.*?</think>', '', text, flags=_re.DOTALL)
+        return cleaned.strip()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYSTEM CONTEXT  (psutil-powered system awareness)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SystemContext:
+    """Gathers system context for intelligent environment awareness."""
+
+    @staticmethod
+    def snapshot() -> dict:
+        mem  = psutil.virtual_memory()
+        cpu  = psutil.cpu_percent(interval=0.3)
+        disk = psutil.disk_usage('/')
+
+        info = {
+            "cpu_percent"     : cpu,
+            "ram_total_gb"    : round(mem.total / (1024**3), 1),
+            "ram_used_gb"     : round(mem.used / (1024**3), 1),
+            "ram_percent"     : mem.percent,
+            "disk_total_gb"   : round(disk.total / (1024**3), 1),
+            "disk_used_percent": disk.percent,
+        }
+
+        # Battery (may not exist on desktops)
+        try:
+            bat = psutil.sensors_battery()
+            if bat:
+                info["battery_percent"] = bat.percent
+                info["battery_plugged"] = bat.power_plugged
+        except Exception:
+            pass
+
+        # Top 5 processes by memory
+        try:
+            procs = []
+            for p in psutil.process_iter(['name', 'memory_percent']):
+                try:
+                    procs.append((p.info['name'], p.info['memory_percent']))
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            procs.sort(key=lambda x: x[1] or 0, reverse=True)
+            info["top_processes"] = [
+                {"name": n, "mem_pct": round(m or 0, 1)} for n, m in procs[:5]
+            ]
+        except Exception:
+            pass
+
+        return info
+
+    @staticmethod
+    def summary() -> str:
+        s = SystemContext.snapshot()
+        lines = [
+            f"CPU: {s['cpu_percent']}%",
+            f"RAM: {s['ram_used_gb']}/{s['ram_total_gb']}GB ({s['ram_percent']}%)",
+            f"Disk: {s['disk_used_percent']}% used of {s['disk_total_gb']}GB",
+        ]
+        if "battery_percent" in s:
+            plug = "⚡" if s.get("battery_plugged") else "🔋"
+            lines.append(f"Battery: {plug} {s['battery_percent']}%")
+        if "top_processes" in s:
+            top = ", ".join(
+                f"{p['name']}({p['mem_pct']}%)" for p in s["top_processes"][:3]
+            )
+            lines.append(f"Top RAM: {top}")
+        return " · ".join(lines)
+
+    @staticmethod
+    def for_llm() -> str:
+        """Compact system context string suitable for injection into LLM prompt."""
+        s = SystemContext.snapshot()
+        parts = [
+            f"CPU {s['cpu_percent']}%",
+            f"RAM {s['ram_used_gb']}/{s['ram_total_gb']}GB",
+            f"Disk {s['disk_used_percent']}%",
+        ]
+        if "battery_percent" in s:
+            parts.append(f"Battery {s['battery_percent']}%")
+        if "top_processes" in s:
+            top3 = ", ".join(f"{p['name']}({p['mem_pct']}%)" for p in s["top_processes"][:3])
+            parts.append(f"Top: {top3}")
+        return "[System: " + " · ".join(parts) + "]"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL EXECUTOR  (safe whitelisted shell + sysinfo)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_TOOL_CALL_RE = re.compile(
+    r'```tool\s*\n\s*(\{.*?\})\s*\n\s*```',
+    re.DOTALL,
+)
+
+
+class ToolExecutor:
+    """Safe tool execution with command whitelisting and blocked-pattern detection."""
+
+    # Commands safe to run without confirmation
+    SAFE_COMMANDS = frozenset({
+        'ls', 'find', 'du', 'df', 'grep', 'wc', 'cat', 'head', 'tail',
+        'echo', 'pwd', 'whoami', 'date', 'uptime', 'uname', 'which',
+        'file', 'stat', 'tree', 'env', 'printenv', 'hostname',
+        'free', 'lsblk', 'ip', 'ss', 'ps',
+        'mkdir', 'touch', 'cp', 'mv', 'sort', 'uniq', 'cut', 'awk', 'sed',
+        'python', 'python3', 'pip', 'uv', 'git', 'npm', 'node',
+    })
+
+    # Patterns that are ALWAYS blocked
+    BLOCKED_PATTERNS = [
+        re.compile(r'\brm\s+(-[a-zA-Z]*f|-[a-zA-Z]*r|--force|--recursive)'),
+        re.compile(r'\bdd\b\s'),
+        re.compile(r'\bmkfs\b'),
+        re.compile(r'>\s*/dev/'),
+        re.compile(r'\bshutdown\b'),
+        re.compile(r'\breboot\b'),
+        re.compile(r'\bsudo\b'),
+        re.compile(r'\bchmod\s+777\b'),
+        re.compile(r'\bcurl\b.*\|\s*(ba)?sh'),
+        re.compile(r'\bwget\b.*\|\s*(ba)?sh'),
+        re.compile(r'\brm\s+-rf\b'),
+    ]
+
+    def __init__(self, console: Console, timeout: int = 30) -> None:
+        self.console        = console
+        self.timeout        = timeout
+        self._last_blocked  : Optional[str] = None  # For /approve
+
+    def is_safe(self, cmd: str) -> tuple[bool, str]:
+        """Check if a command is safe. Returns (is_safe, reason)."""
+        for pattern in self.BLOCKED_PATTERNS:
+            if pattern.search(cmd):
+                return False, f"Blocked: dangerous pattern '{pattern.pattern}'"
+
+        try:
+            parts = shlex.split(cmd)
+            base = parts[0] if parts else ""
+        except ValueError:
+            base = cmd.split()[0] if cmd.split() else ""
+
+        base = Path(base).name  # /usr/bin/ls → ls
+
+        if base in self.SAFE_COMMANDS:
+            return True, "whitelisted"
+
+        return False, f"'{base}' not in safe command list — use /approve to run anyway"
+
+    def execute_shell(self, cmd: str, force: bool = False) -> dict:
+        """Execute a shell command with safety checks."""
+        safe, reason = self.is_safe(cmd)
+
+        if not safe and not force:
+            self._last_blocked = cmd
+            return {"status": "blocked", "reason": reason, "command": cmd}
+
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                timeout=self.timeout, cwd=str(Path.home()),
+            )
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+
+            max_chars = 4000
+            if len(stdout) > max_chars:
+                stdout = stdout[:max_chars] + f"\n… (truncated, {len(stdout)} total chars)"
+
+            return {
+                "status"    : "success" if result.returncode == 0 else "error",
+                "returncode": result.returncode,
+                "stdout"    : stdout,
+                "stderr"    : stderr,
+                "command"   : cmd,
+            }
+        except subprocess.TimeoutExpired:
+            return {"status": "timeout", "reason": f"Timed out after {self.timeout}s", "command": cmd}
+        except Exception as e:
+            return {"status": "error", "reason": str(e), "command": cmd}
+
+    def execute_sysinfo(self) -> dict:
+        """Return system context info."""
+        return {"status": "success", "data": SystemContext.snapshot()}
+
+    def dispatch(self, call: dict) -> dict:
+        """Route a tool call to the appropriate executor."""
+        tool = call.get("tool", "").lower()
+        if tool == "shell":
+            cmd = call.get("command", "")
+            if not cmd:
+                return {"status": "error", "reason": "No command provided"}
+            return self.execute_shell(cmd)
+        elif tool == "sysinfo":
+            return self.execute_sysinfo()
+        else:
+            return {"status": "error", "reason": f"Unknown tool: {tool}"}
+
+    def format_result(self, result: dict) -> Panel:
+        """Format a tool result as a Rich panel for display."""
+        tool_cmd = result.get("command", result.get("tool", "sysinfo"))
+        status   = result["status"]
+
+        if status == "blocked":
+            content = (
+                f"[red bold]⛔ BLOCKED[/red bold]\n"
+                f"[dim]Command:[/dim] {tool_cmd}\n"
+                f"[dim]Reason:[/dim] {result['reason']}\n\n"
+                f"[dim]Use [bold]/approve[/bold] to run this command anyway.[/dim]"
+            )
+            border = "red"
+        elif status == "timeout":
+            content = f"[yellow]⏱ Timed out:[/yellow] {result['reason']}"
+            border = "yellow"
+        elif status == "success" and "data" in result:
+            # sysinfo result
+            data = result["data"]
+            lines = [f"[bold]{k}:[/bold] {v}" for k, v in data.items() if k != "top_processes"]
+            if "top_processes" in data:
+                lines.append("[bold]Top processes:[/bold]")
+                for p in data["top_processes"]:
+                    lines.append(f"  {p['name']}: {p['mem_pct']}% RAM")
+            content = "\n".join(lines)
+            border = "cyan"
+        else:
+            parts = []
+            if result.get("stdout"):
+                parts.append(result["stdout"])
+            if result.get("stderr"):
+                parts.append(f"[yellow]{result['stderr']}[/yellow]")
+            if not parts:
+                parts.append("[dim]No output[/dim]")
+            rc = result.get("returncode", "?")
+            content = "\n".join(parts) + f"\n[dim]exit {rc}[/dim]"
+            border = "green" if rc == 0 else "red"
+
+        return Panel(
+            content,
+            title=f"[bold]🔧 Tool: {tool_cmd}[/bold]",
+            title_align="left",
+            border_style=border,
+            padding=(0, 1),
+        )
+
+    @staticmethod
+    def parse_tool_calls(text: str) -> list[dict]:
+        """Extract tool call JSON blocks from LLM response text."""
+        calls = []
+        for m in _TOOL_CALL_RE.finditer(text):
+            try:
+                obj = json.loads(m.group(1))
+                if isinstance(obj, dict) and "tool" in obj:
+                    calls.append(obj)
+            except json.JSONDecodeError:
+                pass
+        return calls
+
+    @staticmethod
+    def strip_tool_blocks(text: str) -> str:
+        """Remove tool call blocks from response text for clean display."""
+        return _TOOL_CALL_RE.sub('', text).strip()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -977,6 +1312,9 @@ COMMANDS = {
     "/index load <p>" : "Load RAG index from directory <p>",
     "/model <path>"   : "Hot-swap the LLM",
     "/set <key> <val>": "Change a config value at runtime (see /config)",
+    "/run <cmd>"      : "Execute a shell command (safety-checked)",
+    "/sysinfo"        : "Show system resource usage (CPU/RAM/battery)",
+    "/approve"        : "Run the last blocked command anyway",
     "/bench"          : "Show benchmark stats table",
     "/save"           : "Save chat history to JSON",
     "/export"         : "Export conversation to Markdown",
@@ -1004,6 +1342,7 @@ class ChatCLI:
         self.rag    = HybridRetriever(cfg, self.console)
         self.memory = MemoryManager(cfg)
         self.bench  = BenchmarkTracker()
+        self.tools  = ToolExecutor(self.console, cfg.tool_timeout)
 
         self.console.print(
             f"\n[green bold]✓[/green bold] [bold]{Path(cfg.model_path).name}[/bold] ready  "
@@ -1013,6 +1352,8 @@ class ChatCLI:
             f"threshold={cfg.rag_score_threshold})[/dim]\n"
             f"[green bold]✓[/green bold] Memory  "
             f"[dim](window={cfg.memory_max_turns} turns · compress={cfg.memory_summary_tokens} tok)[/dim]\n"
+            f"[green bold]✓[/green bold] Tools   "
+            f"[dim](shell · sysinfo · {len(ToolExecutor.SAFE_COMMANDS)} whitelisted commands)[/dim]\n"
             f"[dim]Type [bold]/help[/bold] for commands · Ctrl-C to interrupt · /quit to exit[/dim]\n"
         )
 
@@ -1021,7 +1362,7 @@ class ChatCLI:
     def _print_banner(self) -> None:
         self.console.print(Panel(
             Text(BANNER, style="bold cyan"),
-            subtitle="[dim]Local · Private · 4-bit · Hybrid RRF RAG · Memory Guard[/dim]",
+            subtitle="[dim]Local · Private · 4-bit · RAG · Tools · Context-Aware[/dim]",
             border_style="cyan", padding=(0, 2),
         ))
 
@@ -1271,6 +1612,43 @@ class ChatCLI:
                   border_style="cyan")
         )
 
+    # ── Tool commands ─────────────────────────────────────────────────────
+
+    def _cmd_run(self, args: str) -> None:
+        """Direct shell execution via /run <command>."""
+        cmd = args.strip()
+        if not cmd:
+            self.console.print("[red]Usage: /run <command>[/red]")
+            return
+        result = self.tools.execute_shell(cmd)
+        self.console.print(self.tools.format_result(result))
+
+    def _cmd_sysinfo(self) -> None:
+        """Display system resource usage."""
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[dim]Gathering system info…[/dim]"),
+            console=self.console, transient=True,
+        ) as p:
+            p.add_task("")
+            summary = SystemContext.summary()
+        self.console.print(Panel(
+            summary,
+            title="[bold]System Context[/bold]",
+            border_style="cyan",
+        ))
+
+    def _cmd_approve(self) -> None:
+        """Run the last blocked command."""
+        if not self.tools._last_blocked:
+            self.console.print("[dim]No blocked command to approve.[/dim]")
+            return
+        cmd = self.tools._last_blocked
+        self.console.print(f"[yellow]Running blocked command:[/yellow] [bold]{cmd}[/bold]")
+        result = self.tools.execute_shell(cmd, force=True)
+        self.console.print(self.tools.format_result(result))
+        self.tools._last_blocked = None
+
     # ── Command dispatch ──────────────────────────────────────────────────
 
     def _handle_command(self, raw: str) -> bool:
@@ -1294,6 +1672,8 @@ class ChatCLI:
             "/export" : self._cmd_export,
             "/config" : self._cmd_config,
             "/docs"   : self._cmd_docs,
+            "/sysinfo": self._cmd_sysinfo,
+            "/approve": self._cmd_approve,
         }
         if cmd in no_arg_dispatch:
             no_arg_dispatch[cmd]()
@@ -1307,6 +1687,8 @@ class ChatCLI:
             self._cmd_model(rest)
         elif cmd == "/set":
             self._cmd_set(rest)
+        elif cmd == "/run":
+            self._cmd_run(rest)
         elif cmd in ("/quit", "/exit", "/q"):
             self._graceful_exit()
         else:
@@ -1352,7 +1734,41 @@ class ChatCLI:
             )
         return est
 
-    # ── One chat turn ─────────────────────────────────────────────────────
+    # ── One chat turn (with think-filter + tool execution loop) ────────────
+
+    def _stream_llm(self, messages: list[dict]) -> tuple[str, dict]:
+        """
+        Stream an LLM response with ThinkFilter applied.
+        Returns (clean_response_text, stat_dict).
+        """
+        self.console.print(Rule("[bold cyan]Amadeus[/bold cyan]", style="cyan"))
+        buf: list[str] = []
+        stat_holder: dict = {}
+        think_filter = ThinkFilter()
+
+        def on_token(tok: str) -> None:
+            visible = think_filter.feed(tok)
+            if visible:
+                self.console.print(visible, end="", markup=False)
+            buf.append(tok)
+
+        def on_done(n_tokens: int, ttft_ms: float, total_ms: float) -> None:
+            stat_holder.update({"n": n_tokens, "ttft": ttft_ms, "total": total_ms})
+
+        try:
+            self.llm.stream(messages, on_token, on_done)
+        except RuntimeError as e:
+            self.console.print(f"\n[red bold]✗ Generation error:[/red bold] {e}")
+        finally:
+            # Flush any remaining filtered content
+            remaining = think_filter.flush()
+            if remaining:
+                self.console.print(remaining, end="", markup=False)
+            self.console.print()
+
+        raw_text = "".join(buf)
+        clean_text = think_filter.clean(raw_text)
+        return clean_text, stat_holder
 
     def _chat_turn(self, user_input: str) -> None:
         self._print_user(user_input)
@@ -1366,11 +1782,6 @@ class ChatCLI:
                 self._print_rag_sources(hits)
 
         # ── Memory: store CLEAN original input (not augmented) ────────
-        # FIX: This is the most important fix in v3.
-        # v2 stored the full augmented message (query + context block) which:
-        #   1. Inflated memory size 3–4× per turn
-        #   2. Caused compression to summarize RAG document text as conversation
-        #   3. Corrupted the rolling summary with document fragments
         self.memory.add("user", user_input)
 
         # ── Compression check ─────────────────────────────────────────
@@ -1382,7 +1793,6 @@ class ChatCLI:
         messages = self.memory.build_messages(self.cfg.system_prompt)
 
         # ── Inject RAG context ONLY into the current-turn LLM call ───
-        # The stored memory message stays clean; only the call gets context.
         if ctx_block:
             messages[-1] = {
                 "role"   : "user",
@@ -1399,41 +1809,56 @@ class ChatCLI:
         # ── Token budget guard ────────────────────────────────────────
         ctx_tokens = self._check_token_budget(messages)
         if ctx_tokens == -1:
-            # Budget exceeded — skip turn, don't store partial assistant message
             return
 
-        # ── Stream response ───────────────────────────────────────────
-        self.console.print(Rule("[bold cyan]Assistant[/bold cyan]", style="cyan"))
-        buf: list[str]  = []
-        stat_holder: dict = {}
+        # ── Stream response (with CoT filtering) ─────────────────────
+        clean_response, stat_holder = self._stream_llm(messages)
 
-        def on_token(tok: str) -> None:
-            self.console.print(tok, end="", markup=False)
-            buf.append(tok)
+        # ── Tool execution loop ───────────────────────────────────────
+        # If the LLM emitted tool calls, execute them and feed results back.
+        tool_rounds = 0
+        while tool_rounds < self.cfg.max_tool_calls:
+            tool_calls = ToolExecutor.parse_tool_calls(clean_response)
+            if not tool_calls:
+                break
 
-        def on_done(n_tokens: int, ttft_ms: float, total_ms: float) -> None:
-            stat_holder.update({"n": n_tokens, "ttft": ttft_ms, "total": total_ms})
+            tool_rounds += 1
+            for call in tool_calls:
+                result = self.tools.dispatch(call)
+                self.console.print(self.tools.format_result(result))
 
-        try:
-            self.llm.stream(messages, on_token, on_done)
-        except RuntimeError as e:
-            # FIX: Clean error display — never injects into token stream
-            self.console.print(f"\n[red bold]✗ Generation error:[/red bold] {e}")
-            if not buf:
-                return   # Nothing to store
-        finally:
-            self.console.print()
+                # Build tool result message for the LLM
+                if result["status"] == "success":
+                    tool_output = result.get("stdout", "") or json.dumps(result.get("data", {}), indent=2)
+                elif result["status"] == "blocked":
+                    tool_output = f"BLOCKED: {result['reason']}. The user must run /approve to allow this."
+                else:
+                    tool_output = f"ERROR: {result.get('reason', result.get('stderr', 'unknown error'))}"
 
-        full_response = "".join(buf)
-        if full_response.strip():
-            self.memory.add("assistant", full_response)
+                messages.append({"role": "assistant", "content": clean_response})
+                messages.append({
+                    "role": "user",
+                    "content": f"[Tool result for '{call.get('command', call.get('tool', ''))}']\n{tool_output}",
+                })
+
+            # Stream follow-up response
+            clean_response, follow_stat = self._stream_llm(messages)
+            # Merge stats (use latest TTFT, sum totals)
+            if follow_stat:
+                stat_holder["total"] = stat_holder.get("total", 0) + follow_stat.get("total", 0)
+                stat_holder["n"] = stat_holder.get("n", 0) + follow_stat.get("n", 0)
+
+        # ── Store clean response (no tool blocks, no think tags) ──────
+        display_text = ToolExecutor.strip_tool_blocks(clean_response)
+        if display_text.strip():
+            self.memory.add("assistant", display_text)
 
         # ── Benchmark ─────────────────────────────────────────────────
         if stat_holder:
             self.bench.record(
-                stat_holder["ttft"],
-                stat_holder["total"],
-                stat_holder["n"],
+                stat_holder.get("ttft", 0),
+                stat_holder.get("total", 0),
+                stat_holder.get("n", 0),
                 len(hits),
                 ctx_tokens if ctx_tokens > 0 else 0,
             )
@@ -1474,32 +1899,33 @@ class ChatCLI:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_args() -> tuple[Config, list[str], bool]:
+    default_cfg = Config()
     p = argparse.ArgumentParser(
-        description="Local LLM CLI v3 — 4-bit + Hybrid RRF RAG + Memory Guard",
+        description="Amadeus — Local LLM CLI · RAG · Tools · Context-Aware",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--model",
-                   default="/home/adityatawde9699/projects/my-ml-project/Amadeus-AI/Model/google_gemma-4-E2B-it-Q4_K_M.gguf",
+                   default=default_cfg.model_path,
                    help="Path to .gguf model file")
-    p.add_argument("--gpu-layers",   type=int,   default=0,
+    p.add_argument("--gpu-layers",   type=int,   default=default_cfg.n_gpu_layers,
                    help="Number of layers to offload to GPU")
-    p.add_argument("--threads",      type=int,   default=4,
+    p.add_argument("--threads",      type=int,   default=default_cfg.n_threads,
                    help="CPU inference threads")
-    p.add_argument("--ctx",          type=int,   default=8192,
+    p.add_argument("--ctx",          type=int,   default=default_cfg.n_ctx,
                    help="Context window size in tokens")
-    p.add_argument("--max-tokens",   type=int,   default=512,
+    p.add_argument("--max-tokens",   type=int,   default=default_cfg.max_tokens,
                    help="Max tokens per response")
-    p.add_argument("--temperature",  type=float, default=0.7)
-    p.add_argument("--embed-model",  default="all-MiniLM-L6-v2",
+    p.add_argument("--temperature",  type=float, default=default_cfg.temperature)
+    p.add_argument("--embed-model",  default=default_cfg.embed_model,
                    help="SentenceTransformer model for embeddings")
-    p.add_argument("--rerank-model", default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+    p.add_argument("--rerank-model", default=default_cfg.rerank_model,
                    help="CrossEncoder model for re-ranking")
-    p.add_argument("--alpha",        type=float, default=0.55,
+    p.add_argument("--alpha",        type=float, default=default_cfg.hybrid_alpha,
                    metavar="ALPHA",
                    help="Linear hybrid weight (ignored if --no-rrf). 1.0=semantic, 0.0=BM25")
     p.add_argument("--no-rrf",       action="store_true",
                    help="Use linear hybrid instead of Reciprocal Rank Fusion")
-    p.add_argument("--memory-turns", type=int,   default=12,
+    p.add_argument("--memory-turns", type=int,   default=default_cfg.memory_max_turns,
                    help="Turns before memory compression kicks in")
     p.add_argument("--load",         metavar="FILE", action="append", default=[],
                    help="Pre-load a document into RAG (repeatable)")
@@ -1507,7 +1933,7 @@ def parse_args() -> tuple[Config, list[str], bool]:
                    help="Pre-load a saved RAG index directory")
     p.add_argument("--system",       default=None,
                    help="Override default system prompt")
-    p.add_argument("--score-threshold", type=float, default=-5.0,
+    p.add_argument("--score-threshold", type=float, default=default_cfg.rag_score_threshold,
                    help="Minimum cross-encoder score to inject a chunk")
     p.add_argument("--no-auto-save", action="store_true",
                    help="Disable auto-save on exit")

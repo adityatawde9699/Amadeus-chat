@@ -12,4 +12,5 @@ dependencies = [
     "rank-bm25>=0.2.2",
     "rich>=15.0.0",
     "sentence-transformers>=5.5.1",
+    "psutil>=7.0.0",
 ]
