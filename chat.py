@@ -72,7 +72,8 @@ from rich.rule     import Rule
 from rich.markdown import Markdown
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from sentence_transformers import SentenceTransformer, CrossEncoder
+# NOTE: sentence_transformers (and its torch dependency, ~1GB+ RAM) is
+# imported lazily inside HybridRetriever — only when RAG is actually used.
 from rank_bm25 import BM25Okapi
 from llama_cpp import Llama
 
@@ -89,10 +90,11 @@ log.addHandler(logging.NullHandler())   # silent by default; caller enables if n
 class Config:
     # ── Model ──────────────────────────────────────────────────────────────
     model_path      : str   = "/home/adityatawde9699/projects/my-ml-project/llama/Models/Qwen3.5-2B.Q4_K_M.gguf"
-    n_ctx           : int   = 8192
+    n_ctx           : int   = 4096
     n_gpu_layers    : int   = 0
-    n_threads       : int   = 4
-    max_tokens      : int   = 4096
+    n_threads       : int   = 0     # 0 = auto-detect physical cores
+    n_batch         : int   = 256   # prompt-eval batch (lower = less RAM)
+    max_tokens      : int   = 1024
     temperature     : float = 0.78
     top_p           : float = 0.95
     top_k           : int   = 40
@@ -106,6 +108,7 @@ class Config:
     # ── RAG ────────────────────────────────────────────────────────────────
     embed_model          : str   = "all-MiniLM-L6-v2"
     rerank_model         : str   = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    use_reranker         : bool  = True    # cross-encoder re-rank (heavy on slow CPUs)
     chunk_size           : int   = 400
     chunk_overlap        : int   = 80
     rag_initial_k        : int   = 10      # candidates before re-rank
@@ -149,6 +152,33 @@ class Config:
     auto_save      : bool = True
     tool_timeout   : int  = 30      # seconds per command
     max_tool_calls : int  = 3       # max tool invocations per turn
+
+    def auto_tune(self) -> list[str]:
+        """
+        Adapt config to the machine before model load.
+        Resolves n_threads=0 to the physical core count (llama.cpp scales
+        with physical cores, not hyperthreads) and dials settings down
+        when free RAM is scarce. Returns human-readable notes.
+        """
+        notes: list[str] = []
+
+        if self.n_threads <= 0:
+            phys = psutil.cpu_count(logical=False) or max(1, (os.cpu_count() or 2) // 2)
+            self.n_threads = max(1, phys)
+            notes.append(f"threads = {self.n_threads} (physical cores)")
+
+        avail_gb = psutil.virtual_memory().available / (1024**3)
+        if avail_gb < 2.0:
+            if self.n_ctx > 2048:
+                self.n_ctx = 2048
+                notes.append("n_ctx = 2048 (low free RAM — free up memory and restart with --ctx 4096)")
+            if self.n_batch > 128:
+                self.n_batch = 128
+                notes.append("n_batch = 128 (low free RAM)")
+            notes.append(
+                f"only {avail_gb:.1f}GB RAM free — close other apps for faster generation"
+            )
+        return notes
 
     def validate(self) -> None:
         """Raise ValueError on obviously invalid config."""
@@ -342,8 +372,9 @@ class VectorStore:
         texts    : list[str],
         sources  : list[str],
         embs     : np.ndarray,
-    ) -> int:
-        """Add chunks. Returns number of NEW (non-duplicate) chunks added."""
+    ) -> list[str]:
+        """Add chunks. Returns the NEW (non-duplicate) chunks actually added,
+        so callers (e.g. BM25) can index exactly the same subset."""
         new_texts, new_sources, new_emb_rows = [], [], []
         for t, s, e in zip(texts, sources, embs):
             h = hashlib.md5(t.encode()).hexdigest()
@@ -355,7 +386,7 @@ class VectorStore:
             new_emb_rows.append(e)
 
         if not new_texts:
-            return 0
+            return []
 
         self.texts.extend(new_texts)
         self.sources.extend(new_sources)
@@ -367,7 +398,7 @@ class VectorStore:
         self._norm_matrix = None   # Invalidate cache
 
         log.debug("VectorStore: added %d chunks (%d total)", len(new_texts), len(self.texts))
-        return len(new_texts)
+        return new_texts
 
     def _get_norm_matrix(self) -> Optional[np.ndarray]:
         """Lazily compute and cache the normalised matrix. O(N×D) only on add."""
@@ -497,15 +528,36 @@ class HybridRetriever:
         self._files  : list[str]            = []    # file names (with dup count)
         self._loaded_hashes: set[str]       = set() # per-file MD5 to prevent double-load
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[dim]{task.description}[/dim]"),
-            console=console, transient=True,
-        ) as p:
-            p.add_task("Loading embedder…")
-            self.embedder = SentenceTransformer(cfg.embed_model)
-            p.add_task("Loading re-ranker…")
-            self.reranker = CrossEncoder(cfg.rerank_model)
+        # Lazy model slots — torch/sentence-transformers cost 1GB+ RAM and
+        # several seconds, so nothing is loaded until RAG is first used.
+        self._embedder = None
+        self._reranker = None
+
+    @property
+    def embedder(self):
+        if self._embedder is None:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[dim]Loading embedder (first RAG use)…[/dim]"),
+                console=self.console, transient=True,
+            ) as p:
+                p.add_task("")
+                from sentence_transformers import SentenceTransformer
+                self._embedder = SentenceTransformer(self.cfg.embed_model)
+        return self._embedder
+
+    @property
+    def reranker(self):
+        if self._reranker is None:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[dim]Loading re-ranker (first RAG use)…[/dim]"),
+                console=self.console, transient=True,
+            ) as p:
+                p.add_task("")
+                from sentence_transformers import CrossEncoder
+                self._reranker = CrossEncoder(self.cfg.rerank_model)
+        return self._reranker
 
     # ── File reading ──────────────────────────────────────────────────────
 
@@ -561,15 +613,18 @@ class HybridRetriever:
         ) as p:
             p.add_task("")
             embs = self.embedder.encode(
-                texts, show_progress_bar=False, batch_size=32
+                texts, show_progress_bar=False, batch_size=16
             )
 
-        added = self.store.add(texts, sources, embs)
-        self.bm25.add(texts[:added] if added < len(texts) else texts)
+        # FIX: BM25 must index exactly the chunks the vector store kept,
+        # not texts[:added] (an arbitrary prefix when duplicates were skipped).
+        new_texts = self.store.add(texts, sources, embs)
+        if new_texts:
+            self.bm25.add(new_texts)
         self._loaded_hashes.add(file_hash)
         self._files.append(path.name)
-        log.info("Loaded '%s': %d chunks (%d new)", path.name, len(texts), added)
-        return added
+        log.info("Loaded '%s': %d chunks (%d new)", path.name, len(texts), len(new_texts))
+        return len(new_texts)
 
     # ── Retrieval pipeline ────────────────────────────────────────────────
 
@@ -638,17 +693,21 @@ class HybridRetriever:
             for i in idxs
         ]
 
-        # Cross-encoder re-rank
-        pairs  = [(query, c["text"]) for c in cands]
-        scores = self.reranker.predict(pairs)
-        for c, s in zip(cands, scores):
-            c["rerank"] = float(s)
-        cands.sort(key=lambda x: x["rerank"], reverse=True)
+        # Cross-encoder re-rank (optional — heavy on slow CPUs)
+        if self.cfg.use_reranker:
+            pairs  = [(query, c["text"]) for c in cands]
+            scores = self.reranker.predict(pairs)
+            for c, s in zip(cands, scores):
+                c["rerank"] = float(s)
+            cands.sort(key=lambda x: x["rerank"], reverse=True)
+            # FIX: Apply minimum score threshold — don't inject irrelevant context
+            threshold = self.cfg.rag_score_threshold
+            return [c for c in cands[:self.cfg.rag_final_k] if c["rerank"] > threshold]
 
-        # FIX: Apply minimum score threshold — don't inject irrelevant context
-        threshold = self.cfg.rag_score_threshold
-        filtered  = [c for c in cands[:self.cfg.rag_final_k] if c["rerank"] > threshold]
-        return filtered
+        # No re-ranker: trust hybrid (RRF) order, reuse score for display
+        for c in cands:
+            c["rerank"] = c["hybrid"]
+        return cands[:self.cfg.rag_final_k]
 
     def build_context(self, query: str) -> tuple[str, list[dict]]:
         hits = self.retrieve(query)
@@ -887,6 +946,9 @@ class LLMEngine:
                 n_ctx        = self.cfg.n_ctx,
                 n_gpu_layers = self.cfg.n_gpu_layers,
                 n_threads    = self.cfg.n_threads,
+                n_batch      = self.cfg.n_batch,
+                use_mmap     = True,    # page weights in from disk on demand
+                use_mlock    = False,   # never pin — lets the OS reclaim pages
                 verbose      = False,
             )
         self.cfg.model_path = path
@@ -1338,6 +1400,9 @@ class ChatCLI:
         self.rag_on  = True
         self._print_banner()
 
+        for note in cfg.auto_tune():
+            self.console.print(f"[dim]⚙ auto-tune: {note}[/dim]")
+
         self.llm    = LLMEngine(cfg, self.console)
         self.rag    = HybridRetriever(cfg, self.console)
         self.memory = MemoryManager(cfg)
@@ -1346,10 +1411,11 @@ class ChatCLI:
 
         self.console.print(
             f"\n[green bold]✓[/green bold] [bold]{Path(cfg.model_path).name}[/bold] ready  "
-            f"[dim](ctx={cfg.n_ctx} · gpu_layers={cfg.n_gpu_layers})[/dim]\n"
+            f"[dim](ctx={cfg.n_ctx} · threads={cfg.n_threads} · batch={cfg.n_batch} · "
+            f"gpu_layers={cfg.n_gpu_layers})[/dim]\n"
             f"[green bold]✓[/green bold] Hybrid RAG  "
-            f"[dim](RRF={cfg.use_rrf} · α={cfg.hybrid_alpha} · top-{cfg.rag_final_k} · "
-            f"threshold={cfg.rag_score_threshold})[/dim]\n"
+            f"[dim](lazy — models load on first /load · RRF={cfg.use_rrf} · "
+            f"top-{cfg.rag_final_k} · rerank={cfg.use_reranker})[/dim]\n"
             f"[green bold]✓[/green bold] Memory  "
             f"[dim](window={cfg.memory_max_turns} turns · compress={cfg.memory_summary_tokens} tok)[/dim]\n"
             f"[green bold]✓[/green bold] Tools   "
@@ -1910,7 +1976,9 @@ def parse_args() -> tuple[Config, list[str], bool]:
     p.add_argument("--gpu-layers",   type=int,   default=default_cfg.n_gpu_layers,
                    help="Number of layers to offload to GPU")
     p.add_argument("--threads",      type=int,   default=default_cfg.n_threads,
-                   help="CPU inference threads")
+                   help="CPU inference threads (0 = auto-detect physical cores)")
+    p.add_argument("--batch",        type=int,   default=default_cfg.n_batch,
+                   help="Prompt-eval batch size (lower = less RAM)")
     p.add_argument("--ctx",          type=int,   default=default_cfg.n_ctx,
                    help="Context window size in tokens")
     p.add_argument("--max-tokens",   type=int,   default=default_cfg.max_tokens,
@@ -1925,6 +1993,8 @@ def parse_args() -> tuple[Config, list[str], bool]:
                    help="Linear hybrid weight (ignored if --no-rrf). 1.0=semantic, 0.0=BM25")
     p.add_argument("--no-rrf",       action="store_true",
                    help="Use linear hybrid instead of Reciprocal Rank Fusion")
+    p.add_argument("--no-rerank",    action="store_true",
+                   help="Skip cross-encoder re-ranking (faster + less RAM on slow CPUs)")
     p.add_argument("--memory-turns", type=int,   default=default_cfg.memory_max_turns,
                    help="Turns before memory compression kicks in")
     p.add_argument("--load",         metavar="FILE", action="append", default=[],
@@ -1952,6 +2022,7 @@ def parse_args() -> tuple[Config, list[str], bool]:
         model_path          = a.model,
         n_gpu_layers        = a.gpu_layers,
         n_threads           = a.threads,
+        n_batch             = a.batch,
         n_ctx               = a.ctx,
         max_tokens          = a.max_tokens,
         temperature         = a.temperature,
@@ -1959,6 +2030,7 @@ def parse_args() -> tuple[Config, list[str], bool]:
         rerank_model        = a.rerank_model,
         hybrid_alpha        = a.alpha,
         use_rrf             = not a.no_rrf,
+        use_reranker        = not a.no_rerank,
         memory_max_turns    = a.memory_turns,
         rag_score_threshold = a.score_threshold,
         auto_save           = not a.no_auto_save,

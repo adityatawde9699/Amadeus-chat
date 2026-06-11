@@ -11,6 +11,12 @@ A powerful, entirely local Command-Line Interface (CLI) for running quantized LL
 ### 🔒 100% Local & Private
 Runs entirely on-device using `llama-cpp-python`. No data is ever sent to external APIs.
 
+### ⚡ Low-RAM Friendly (runs on 4GB machines)
+- **Hardware auto-tune** at startup: detects physical cores and free RAM, then picks sane `threads`, `n_ctx`, and batch size automatically.
+- **Lazy RAG loading** — torch/sentence-transformers (1GB+ RAM) load only on first `/load`, not at startup. Plain chat starts in ~1 second.
+- **mmap model weights** — pages stream in from disk on demand instead of being pinned in RAM.
+- `--no-rerank` skips the cross-encoder for faster retrieval on slow CPUs.
+
 ### 🔍 Advanced Hybrid RAG
 - Ingests **PDF, Markdown, CSV, JSON, HTML, TXT, RST, and Python** files.
 - **Recursive chunking** with word-aligned overlap to prevent mid-word fragment corruption.
@@ -90,7 +96,7 @@ uv run chat.py
 
 Or override any parameter via CLI flags:
 ```bash
-uv run chat.py --model ./Models/my-model.Q4_K_M.gguf --ctx 8192 --gpu-layers 35
+uv run chat.py --model ./Models/my-model.Q4_K_M.gguf --ctx 8192 --threads 4
 ```
 
 Pre-load a document into RAG at startup:
@@ -110,15 +116,17 @@ uv run chat.py --system "You are a Python expert. Be terse."
 | Flag | Default | Description |
 |---|---|---|
 | `--model` | `Models/Qwen3.5-2B.Q4_K_M.gguf` | Path to `.gguf` model file |
-| `--ctx` | `8192` | Context window size (tokens) |
-| `--max-tokens` | `4096` | Max tokens per response |
+| `--ctx` | `4096` | Context window size (tokens) |
+| `--max-tokens` | `1024` | Max tokens per response |
 | `--temperature` | `0.78` | Sampling temperature |
 | `--gpu-layers` | `0` | Layers to offload to GPU |
-| `--threads` | `4` | CPU inference threads |
+| `--threads` | `0` (auto) | CPU inference threads (0 = physical core count) |
+| `--batch` | `256` | Prompt-eval batch size (lower = less RAM) |
 | `--embed-model` | `all-MiniLM-L6-v2` | SentenceTransformer for embeddings |
 | `--rerank-model` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | CrossEncoder for re-ranking |
 | `--alpha` | `0.55` | Hybrid weight (ignored when using RRF) |
 | `--no-rrf` | `False` | Use linear hybrid instead of RRF |
+| `--no-rerank` | `False` | Skip cross-encoder re-ranking (faster on slow CPUs) |
 | `--memory-turns` | `12` | Turns before memory compression triggers |
 | `--score-threshold` | `-5.0` | Min cross-encoder score to include a chunk |
 | `--load` | — | Pre-load a file into RAG (repeatable) |
