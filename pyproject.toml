@@ -1,16 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "llama"
+name = "amadeus-chat"
 version = "0.1.0"
-description = "Add your description here"
+description = "Amadeus-chat — deterministic-first, fire-and-forget CLI assistant"
 readme = "README.md"
 requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Amadeus Project" }]
+keywords = ["cli", "llm", "notes", "git", "research", "local-first"]
+
 dependencies = [
-    "llama-cpp-python>=0.3.23",
-    "numpy>=2.4.6",
-    "pypdf>=6.12.2",
-    "python-dotenv>=1.2.2",
+    "psutil>=5.9",
+    "rich>=13.0",
     "rank-bm25>=0.2.2",
-    "rich>=15.0.0",
-    "sentence-transformers>=5.5.1",
-    "psutil>=7.0.0",
+    "requests>=2.28",
+    "beautifulsoup4>=4.11",
 ]
+
+[project.optional-dependencies]
+# The LLM is optional — install only on machines that can spare the RAM.
+# This pulls in llama-cpp-python (~50MB wheel + ~1.6GB model on disk).
+llm = [
+    "llama-cpp-python>=0.2.50",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+amadeus = "amadeus.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["amadeus*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
