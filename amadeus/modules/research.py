@@ -21,7 +21,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -40,14 +40,21 @@ _USER_AGENT = (
 )
 
 
-def _fetch(url: str, cfg: Config, *, as_text: bool = True) -> str | bytes | None:
+def _fetch(url: str, cfg: Config, *, as_text: bool = True,
+           data: dict[str, str] | None = None) -> str | bytes | None:
+    """Fetch a URL.  Issues a POST when ``data`` is given, otherwise a GET."""
     try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": cfg.research.user_agent or _USER_AGENT},
-            timeout=cfg.research.fetch_timeout,
-            allow_redirects=True,
-        )
+        headers = {"User-Agent": cfg.research.user_agent or _USER_AGENT}
+        if data is not None:
+            resp = requests.post(
+                url, data=data, headers=headers,
+                timeout=cfg.research.fetch_timeout, allow_redirects=True,
+            )
+        else:
+            resp = requests.get(
+                url, headers=headers,
+                timeout=cfg.research.fetch_timeout, allow_redirects=True,
+            )
         resp.raise_for_status()
         return resp.text if as_text else resp.content
     except requests.RequestException as exc:
@@ -55,27 +62,53 @@ def _fetch(url: str, cfg: Config, *, as_text: bool = True) -> str | bytes | None
         return None
 
 
+def _decode_ddg_href(href: str) -> str | None:
+    """Resolve a DuckDuckGo result anchor to a real target URL.
+
+    Handles three shapes: protocol-relative ``//`` links, the
+    ``//duckduckgo.com/l/?uddg=<encoded>`` redirect wrapper, and plain
+    ``http(s)`` links.  Returns ``None`` for DDG-internal / non-result links.
+    """
+    if not href:
+        return None
+    if href.startswith("//"):
+        href = "https:" + href
+    if "uddg=" in href:
+        qs = href.split("?", 1)[1] if "?" in href else ""
+        target = parse_qs(qs).get("uddg", [None])[0]
+        return unquote(target) if target else None
+    if href.startswith("http") and "duckduckgo.com" not in href:
+        return href
+    return None
+
+
 def _ddg_search(topic: str, cfg: Config) -> list[str]:
-    """Scrape DuckDuckGo HTML for result URLs.  No API key required."""
-    url = f"https://html.duckduckgo.com/html/?q={quote_plus(topic)}"
-    html = _fetch(url, cfg)
-    if not html:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
+    """Query DuckDuckGo for result URLs via its no-JS HTML endpoints.
+
+    DuckDuckGo's ``html/`` endpoint now serves an anomaly page for GET
+    requests but honours POST, so we POST the query.  We try the HTML
+    endpoint first, fall back to the ``lite/`` endpoint, deduplicate, and
+    skip DuckDuckGo-internal links.  No API key required.
+    """
+    endpoints = (
+        ("https://html.duckduckgo.com/html/", "a.result__a"),
+        ("https://lite.duckduckgo.com/lite/", "a.result-link"),
+    )
+    seen: set[str] = set()
     out: list[str] = []
-    for a in soup.select("a.result__a"):
-        href = a.get("href", "")
-        # DuckDuckGo wraps links as //duckduckgo.com/l/?uddg=<encoded>
-        if "uddg=" in href:
-            from urllib.parse import parse_qs, unquote
-            qs = href.split("?", 1)[1] if "?" in href else ""
-            params = parse_qs(qs)
-            target = params.get("uddg", [None])[0]
-            if target:
-                out.append(unquote(target))
-        elif href.startswith("http"):
-            out.append(href)
-        if len(out) >= cfg.research.max_pages:
+    for url, selector in endpoints:
+        html = _fetch(url, cfg, data={"q": topic})
+        if not html:
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.select(selector):
+            target = _decode_ddg_href(a.get("href", ""))
+            if target and target not in seen:
+                seen.add(target)
+                out.append(target)
+                if len(out) >= cfg.research.max_pages:
+                    return out
+        if out:
             break
     return out
 
@@ -126,7 +159,7 @@ _SUMMARY_SYSTEM_PROMPT = (
     "sections `## Summary` (2-3 paragraphs), `## Key Points` (bullet list), and "
     "`## Sources`. Synthesise only what the provided excerpts contain — do not "
     "invent facts; if the excerpts are sparse, say so explicitly. Reply with "
-    "only the report."
+    "only the report. /no_think"
 )
 
 _SUMMARY_USER_TEMPLATE = """\
@@ -148,8 +181,13 @@ def _summarise(cfg: Config, topic: str, excerpts: list[dict[str, str]]) -> str:
     if not body:
         return _deterministic_report(topic, excerpts)
 
-    # Cap excerpts so the prompt + reply fits the (low-RAM) n_ctx window.
-    user_msg = _SUMMARY_USER_TEMPLATE.format(topic=topic, excerpts=body[:6000])
+    # Budget the context window: cap the excerpts so there is room left for the
+    # generated report.  ~4 chars/token is a rough but safe estimate.  Sending
+    # `/no_think` (above) keeps a reasoning model from spending the whole budget
+    # on its chain-of-thought and truncating the report mid-sentence.
+    excerpt_cap = 3500
+    report_tokens = max(cfg.model.max_tokens, min(768, cfg.model.n_ctx - 1200))
+    user_msg = _SUMMARY_USER_TEMPLATE.format(topic=topic, excerpts=body[:excerpt_cap])
     try:
         with llm_session(cfg) as llm:
             if llm is None:
@@ -160,7 +198,7 @@ def _summarise(cfg: Config, topic: str, excerpts: list[dict[str, str]]) -> str:
                     {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                max_tokens=cfg.model.max_tokens,
+                max_tokens=report_tokens,
                 temperature=cfg.model.temperature,
             )
         return report or _deterministic_report(topic, excerpts)
